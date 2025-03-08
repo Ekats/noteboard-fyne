@@ -1,0 +1,26 @@
+cat << EOF > .gitignore
+# Ignore build directories
+/build/
+/dist/
+
+# Ignore dependency directories
+/node_modules/
+/vendor/
+
+# Ignore environment files
+.env
+*.env
+
+# IDE-specific files
+.vscode/
+.idea/
+
+# Compiled files
+*.exe
+*.log
+*.out
+
+# OS generated files
+.DS_Store
+Thumbs.db
+EOF

@@ -1,0 +1,8 @@
+[App]
+ID = "io.github.ekats.noteboard"
+Name = "NoteBoard"
+Version = "1.0.0"
+
+[Build]
+BuildMode = "release"
+Tags = "wayland"
