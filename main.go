@@ -6,6 +6,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +29,7 @@ const (
 	configFileName    = "clipboard_manager_config.json"
 	appID             = "io.github.ekats.manjaro-clipboard"
 	appName           = "Manjaro Clipboard Manager"
+	socketName        = "manjaro-clipboard.sock"
 )
 
 // ClipboardItem represents a single item in the clipboard history
@@ -141,6 +143,62 @@ func saveConfig(config Config) error {
 // isWaylandSession detects if running on Wayland
 func isWaylandSession() bool {
 	return os.Getenv("XDG_SESSION_TYPE") == "wayland"
+}
+
+func ensureSingleInstance() bool {
+	// Get user's home directory for socket path
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Printf("Warning: Could not get home directory: %v\n", err)
+		return false
+	}
+
+	// Create runtime directory if it doesn't exist
+	runtimeDir := filepath.Join(homeDir, ".config", "clipboard-manager", "runtime")
+	if _, err := os.Stat(runtimeDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(runtimeDir, 0755); err != nil {
+			fmt.Printf("Warning: Could not create runtime directory: %v\n", err)
+			return false
+		}
+	}
+
+	socketPath := filepath.Join(runtimeDir, socketName)
+
+	// Remove socket if it exists but process is not running
+	if _, err := os.Stat(socketPath); err == nil {
+		// Try to connect to the socket
+		conn, err := net.Dial("unix", socketPath)
+		if err == nil {
+			// If connection succeeds, another instance is running
+			conn.Close()
+			fmt.Println("Another instance is already running. Exiting.")
+			return true
+		}
+
+		// If connection fails, remove the stale socket
+		os.Remove(socketPath)
+	}
+
+	// Create and listen on the socket
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		fmt.Printf("Warning: Could not create socket: %v\n", err)
+		return false
+	}
+
+	// Start a goroutine to accept connections
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				continue
+			}
+			// Just close the connection, we're just detecting other instances
+			conn.Close()
+		}
+	}()
+
+	return false
 }
 
 // createDesktopFile creates a .desktop file for autostart
@@ -604,6 +662,12 @@ func (cm *ClipboardManager) UpdateHotkey(modifierKey, actionKey string) {
 }
 
 func main() {
+	// Check if another instance is running
+	if ensureSingleInstance() {
+		// Exit if another instance is already running
+		return
+	}
+
 	// Create app with consistent ID
 	a := app.NewWithID(appID)
 	a.Settings().SetTheme(theme.DarkTheme())
@@ -663,7 +727,17 @@ func main() {
 			}),
 		)
 		desk.SetSystemTrayMenu(m)
-		desk.SetSystemTrayIcon(theme.ContentPasteIcon())
+		// Try to load custom icon
+		iconPath := "noteboard-fyne.png" // Relative to executable directory
+		customIcon, err := loadIconResource(iconPath)
+		if err != nil {
+			// Fall back to default icon on error
+			fmt.Printf("Could not load custom icon: %v. Using default icon.\n", err)
+			desk.SetSystemTrayIcon(theme.ContentPasteIcon())
+		} else {
+			// Use custom icon
+			desk.SetSystemTrayIcon(customIcon)
+		}
 	}
 
 	// Settings button
@@ -712,4 +786,41 @@ func main() {
 
 	w.Show()
 	a.Run()
+}
+
+// Function to load an icon from the project directory
+func loadIconResource(iconPath string) (fyne.Resource, error) {
+	// First check if the path is absolute
+	if !filepath.IsAbs(iconPath) {
+		// Get the executable directory
+		execPath, err := os.Executable()
+		if err != nil {
+			return nil, err
+		}
+
+		// Combine with the executable directory to make it absolute
+		iconPath = filepath.Join(filepath.Dir(execPath), iconPath)
+	}
+
+	// Check if file exists
+	_, err := os.Stat(iconPath)
+	if os.IsNotExist(err) {
+		return nil, err
+	}
+
+	// Load the file content
+	iconBytes, err := os.ReadFile(iconPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get the file extension and convert to lowercase
+	ext := filepath.Ext(iconPath)
+	if ext == "" {
+		ext = ".png" // Assume PNG if no extension
+	}
+
+	// Create a static resource from the icon file
+	iconName := filepath.Base(iconPath)
+	return fyne.NewStaticResource(iconName, iconBytes), nil
 }
