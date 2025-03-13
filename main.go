@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,9 +28,9 @@ import (
 const (
 	maxClipboardItems = 24
 	configFileName    = "clipboard_manager_config.json"
-	appID             = "io.github.ekats.manjaro-clipboard"
-	appName           = "Manjaro Clipboard Manager"
-	socketName        = "manjaro-clipboard.sock"
+	appID             = "io.github.ekats.noteboard"
+	appName           = "NoteBoard"
+	socketName        = "noteboard.sock"
 )
 
 // ClipboardItem represents a single item in the clipboard history
@@ -49,6 +50,23 @@ type ClipboardManager struct {
 	hotkeySettings HotkeySettings
 	configPath     string
 	isWayland      bool
+}
+
+// CustomTooltip is a widget that shows content in a pop-up window when activated
+type CustomTooltip struct {
+	widget.DisableableWidget
+	content     string
+	popupWindow fyne.Window
+	parent      fyne.Window
+	showDelay   *time.Timer
+	hideDelay   *time.Timer
+}
+
+// tooltipRenderer handles the layout of the tooltip button
+type tooltipRenderer struct {
+	tooltip *CustomTooltip
+	text    *widget.Label
+	objects []fyne.CanvasObject
 }
 
 // HotkeySettings stores user-configured keyboard shortcuts
@@ -306,117 +324,7 @@ func newClipboardManager(w fyne.Window) *ClipboardManager {
 		isWayland:      isWayland,
 	}
 
-	cm.list = widget.NewList(
-		func() int {
-			return len(cm.items)
-		},
-		func() fyne.CanvasObject {
-			// Create a template for list items
-			contentLabel := widget.NewLabel("Template content")
-			contentLabel.Wrapping = fyne.TextWrapWord
-
-			timeLabel := widget.NewLabel("Time")
-			timeLabel.TextStyle = fyne.TextStyle{Italic: true}
-
-			pinButton := widget.NewButtonWithIcon("", theme.ContentAddIcon(), func() {})
-			copyButton := widget.NewButtonWithIcon("", theme.ContentCopyIcon(), func() {})
-			deleteButton := widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {})
-
-			buttons := container.NewHBox(pinButton, copyButton, deleteButton)
-
-			bottomBar := container.NewBorder(nil, nil, timeLabel, buttons)
-
-			// Create the main container properly
-			return container.NewBorder(
-				nil,
-				bottomBar,
-				nil,
-				nil,
-				contentLabel,
-			)
-		},
-		func(i widget.ListItemID, o fyne.CanvasObject) {
-			if i >= len(cm.items) {
-				return // Safety check for index out of range
-			}
-
-			item := cm.items[i]
-
-			// Properly cast to container
-			content, ok := o.(*fyne.Container)
-			if !ok {
-				return // Skip if wrong type
-			}
-
-			// Get components with proper type checking
-			contentLabel, _ := content.Objects[0].(*widget.Label)
-			bottomBar, _ := content.Objects[1].(*fyne.Container)
-
-			if contentLabel != nil {
-				// Set content
-				truncatedContent := item.content
-				if len(truncatedContent) > 100 {
-					truncatedContent = truncatedContent[:100] + "..."
-				}
-				contentLabel.SetText(truncatedContent)
-			}
-
-			if bottomBar != nil {
-				timeLabel, _ := bottomBar.Objects[0].(*widget.Label)
-				buttonsContainer, _ := bottomBar.Objects[1].(*fyne.Container)
-
-				if timeLabel != nil {
-					// Set time
-					timeLabel.SetText(item.timestamp.Format("15:04:05"))
-				}
-
-				if buttonsContainer != nil && len(buttonsContainer.Objects) >= 3 {
-					pinButton, _ := buttonsContainer.Objects[0].(*widget.Button)
-					copyButton, _ := buttonsContainer.Objects[1].(*widget.Button)
-					deleteButton, _ := buttonsContainer.Objects[2].(*widget.Button)
-
-					// Set pin icon based on state
-					if pinButton != nil {
-						if cm.pinned[i] {
-							pinButton.SetIcon(theme.ContentRemoveIcon())
-						} else {
-							pinButton.SetIcon(theme.ContentAddIcon())
-						}
-
-						pinButton.OnTapped = func() {
-							cm.pinned[i] = !cm.pinned[i]
-							cm.list.Refresh()
-						}
-					}
-
-					// Set button actions
-					if copyButton != nil {
-						copyButton.OnTapped = func() {
-							go func() {
-								if cm.isWayland {
-									// For Wayland, use wl-copy instead of robotgo
-									cmd := exec.Command("wl-copy", item.content)
-									cmd.Run()
-								} else {
-									robotgo.WriteAll(item.content)
-								}
-
-								// We can't use RunOnMain as it's not available in your Fyne version
-								// Instead, we'll hide the window directly
-								cm.window.Hide()
-							}()
-						}
-					}
-
-					if deleteButton != nil {
-						deleteButton.OnTapped = func() {
-							cm.removeItem(i)
-						}
-					}
-				}
-			}
-		},
-	)
+	cm.list = cm.createItemList()
 
 	cm.clearButton = widget.NewButton("Clear All", func() {
 		cm.clearItems()
@@ -465,6 +373,435 @@ func (cm *ClipboardManager) addItem(content string) {
 
 	// Refresh the list
 	cm.list.Refresh()
+}
+
+// NewCustomTooltip creates a new custom tooltip for showing text content
+func NewCustomTooltip(content string, parent fyne.Window) *CustomTooltip {
+	tooltip := &CustomTooltip{
+		content: content,
+		parent:  parent,
+	}
+	tooltip.ExtendBaseWidget(tooltip)
+	return tooltip
+}
+
+// CreateRenderer is a private method to Fyne which defines how this widget is rendered
+func (t *CustomTooltip) CreateRenderer() fyne.WidgetRenderer {
+	text := widget.NewLabel("...")
+	text.Alignment = fyne.TextAlignCenter
+
+	return &tooltipRenderer{
+		tooltip: t,
+		text:    text,
+		objects: []fyne.CanvasObject{text},
+	}
+}
+
+func (r *tooltipRenderer) MinSize() fyne.Size {
+	return r.text.MinSize()
+}
+
+func (r *tooltipRenderer) Layout(size fyne.Size) {
+	r.text.Resize(size)
+}
+
+func (r *tooltipRenderer) Refresh() {
+	r.text.Refresh()
+}
+
+func (r *tooltipRenderer) Objects() []fyne.CanvasObject {
+	return r.objects
+}
+
+func (r *tooltipRenderer) Destroy() {}
+
+// MouseIn is called when the mouse enters the tooltip area
+func (t *CustomTooltip) MouseIn(event *desktop.MouseEvent) {
+	// Cancel any pending hide timer
+	if t.hideDelay != nil {
+		t.hideDelay.Stop()
+		t.hideDelay = nil
+	}
+
+	// Start show timer (300ms delay before showing)
+	t.showDelay = time.AfterFunc(300*time.Millisecond, func() {
+		t.showContent()
+	})
+}
+
+// MouseOut is called when the mouse leaves the tooltip area
+func (t *CustomTooltip) MouseOut() {
+	// Cancel any pending show timer
+	if t.showDelay != nil {
+		t.showDelay.Stop()
+		t.showDelay = nil
+	}
+
+	// Start hide timer (200ms delay before hiding)
+	t.hideDelay = time.AfterFunc(200*time.Millisecond, func() {
+		t.hideContent()
+	})
+}
+
+// MouseMoved is called when the mouse moves within the tooltip area
+func (t *CustomTooltip) MouseMoved(*desktop.MouseEvent) {}
+
+// showContent displays the tooltip content
+func (t *CustomTooltip) showContent() {
+	// If there's already a popup open, close it
+	if t.popupWindow != nil {
+		t.popupWindow.Close()
+		t.popupWindow = nil
+	}
+
+	// Create the popup window
+	app := fyne.CurrentApp()
+	t.popupWindow = app.NewWindow("Content")
+	t.popupWindow.SetFixedSize(true)
+
+	// Set window type hint if available
+	if typeHint, ok := t.popupWindow.(interface{ SetDialogType() }); ok {
+		typeHint.SetDialogType()
+	}
+
+	// Create content
+	textDisplay := widget.NewLabel(t.content)
+	textDisplay.Wrapping = fyne.TextWrapWord
+
+	// Create scrollable container
+	scrollContainer := container.NewScroll(textDisplay)
+	scrollContainer.Resize(fyne.NewSize(400, 300))
+
+	t.popupWindow.SetContent(scrollContainer)
+
+	// Position the window near the cursor for better UX
+	// This works on both X11 and Wayland
+	curX, curY := robotgo.Location()
+
+	// Check if we're on Wayland
+	isWayland := os.Getenv("XDG_SESSION_TYPE") == "wayland"
+
+	if isWayland {
+		// For Wayland, we'll use a different approach
+		// First resize the window
+		t.popupWindow.Resize(fyne.NewSize(400, 300))
+
+		// Then force XWayland usage for this window if possible
+		// Set the env var for XWayland before window is mapped
+		if setter, ok := t.popupWindow.(interface{ SetEnv(string, string) }); ok {
+			setter.SetEnv("GDK_BACKEND", "x11")
+		}
+
+		// Use xdg-decoration protocol to remove decorations if available
+		if setter, ok := t.popupWindow.(interface{ SetDecoration(bool) }); ok {
+			setter.SetDecoration(false)
+		}
+
+		// For KDE on Wayland, we can try to set a window rule
+		if isKDEPlasma() {
+			// Create a temporary unique identifier for this window
+			uniqueID := fmt.Sprintf("tooltip-%d", time.Now().UnixNano())
+
+			// Try to set window role to get a consistent identifier
+			if roleSetter, ok := t.popupWindow.(interface{ SetRole(string) }); ok {
+				roleSetter.SetRole(uniqueID)
+			}
+
+			// Delay execution to ensure window is created
+			go func() {
+				time.Sleep(100 * time.Millisecond)
+
+				// Try to position with KWin DBus API
+				exec.Command("qdbus", "org.kde.KWin", "/KWin",
+					"org.kde.KWin.setWindowGeometry", uniqueID,
+					strconv.Itoa(curX+20), strconv.Itoa(curY+20),
+					"400", "300").Run()
+			}()
+		}
+	} else {
+		// For X11, use the standard approach
+		// Position window near cursor directly without needing parent position
+		if mover, ok := t.popupWindow.(interface{ SetPosition(x, y int) }); ok {
+			// Set position to near mouse cursor
+			mover.SetPosition(curX+20, curY+20)
+		}
+	}
+
+	// Make it an overlay window (no decorations)
+	if setter, ok := t.popupWindow.(interface{ SetDecoration(bool) }); ok {
+		setter.SetDecoration(false)
+	}
+
+	// Make it stay on top of other windows
+	if setter, ok := t.popupWindow.(interface{ SetOnTop(bool) }); ok {
+		setter.SetOnTop(true)
+	}
+
+	// For better Wayland support, try multiple methods
+	go func() {
+		// Wait a bit for window to be mapped
+		time.Sleep(100 * time.Millisecond)
+
+		if isWayland {
+			// Try to use wl-shell-surface protocol if available
+			runWaylandPositioningCommands(t.popupWindow, curX+20, curY+20)
+		} else {
+			// For X11, use xprop
+			// Try to find our window ID
+			cmd := exec.Command("xdotool", "search", "--name", "Content")
+			output, err := cmd.Output()
+			if err == nil && len(output) > 0 {
+				// Get the first window ID
+				lines := strings.Split(string(output), "\n")
+				if len(lines) > 0 {
+					windowID := strings.TrimSpace(lines[0])
+					if windowID != "" {
+						// Set the window type to tooltip or notification
+						exec.Command("xprop", "-id", windowID, "-f", "_NET_WM_WINDOW_TYPE", "32a",
+							"-set", "_NET_WM_WINDOW_TYPE", "_NET_WM_WINDOW_TYPE_NOTIFICATION").Run()
+
+						// Also set the window to always stay on top
+						exec.Command("xprop", "-id", windowID, "-f", "_NET_WM_STATE", "32a",
+							"-set", "_NET_WM_STATE", "_NET_WM_STATE_ABOVE,_NET_WM_STATE_STAYS_ON_TOP").Run()
+
+						// Position window near the cursor
+						exec.Command("xdotool", "windowmove", windowID,
+							strconv.Itoa(curX+20), strconv.Itoa(curY+20)).Run()
+					}
+				}
+			}
+		}
+	}()
+
+	// Show the window
+	t.popupWindow.Show()
+}
+
+// Helper function to run Wayland-specific positioning commands
+func runWaylandPositioningCommands(window fyne.Window, x, y int) {
+	// First try to see if we can get the window ID via XWayland
+	cmd := exec.Command("xwininfo", "-name", "Content")
+	output, err := cmd.CombinedOutput()
+	if err == nil && strings.Contains(string(output), "Window id") {
+		// Parse window ID
+		lines := strings.Split(string(output), "\n")
+		for _, line := range lines {
+			if strings.Contains(line, "Window id") {
+				parts := strings.Split(line, " ")
+				if len(parts) > 3 {
+					windowID := strings.TrimSpace(parts[3])
+					// Move window using xdotool (works with XWayland)
+					exec.Command("xdotool", "windowmove", windowID,
+						strconv.Itoa(x), strconv.Itoa(y)).Run()
+					return
+				}
+			}
+		}
+	}
+
+	// If we're on KDE Plasma, try with KWin's DBus interface
+	if isKDEPlasma() {
+		// Find window by title
+		cmd := exec.Command("qdbus", "org.kde.KWin", "/KWin", "org.kde.KWin.queryWindowInfo")
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			lines := strings.Split(string(output), "\n")
+			for _, line := range lines {
+				if strings.Contains(line, "Content") {
+					// Found our window, try to move it
+					parts := strings.Split(line, ",")
+					if len(parts) > 0 {
+						winID := strings.TrimSpace(parts[0])
+						exec.Command("qdbus", "org.kde.KWin", "/KWin",
+							"org.kde.KWin.setWindowGeometry", winID,
+							strconv.Itoa(x), strconv.Itoa(y),
+							"400", "300").Run()
+						return
+					}
+				}
+			}
+		}
+	}
+}
+
+// hideContent hides the tooltip content
+func (t *CustomTooltip) hideContent() {
+	if t.popupWindow != nil {
+		t.popupWindow.Close()
+		t.popupWindow = nil
+	}
+}
+
+// Tapped handles tap events - show the tooltip on tap as well
+func (t *CustomTooltip) Tapped(*fyne.PointEvent) {
+	if t.popupWindow != nil {
+		t.hideContent()
+	} else {
+		t.showContent()
+	}
+}
+
+// Now, modify the existing createItemList function to use our custom tooltip
+func (cm *ClipboardManager) createItemList() *widget.List {
+	return widget.NewList(
+		func() int {
+			return len(cm.items)
+		},
+		func() fyne.CanvasObject {
+			// Create a template for list items
+			contentLabel := widget.NewLabel("Template content")
+			contentLabel.Wrapping = fyne.TextWrapWord
+			contentLabel.Truncation = fyne.TextTruncateEllipsis
+
+			// Create placeholder for the tooltip
+			tooltipPlaceholder := container.NewStack(
+				widget.NewLabel("..."), // This will be replaced in updateItem
+			)
+
+			// Content container with label and tooltip placeholder
+			contentContainer := container.NewBorder(nil, nil, nil, tooltipPlaceholder, contentLabel)
+
+			timeLabel := widget.NewLabel("Time")
+			timeLabel.TextStyle = fyne.TextStyle{Italic: true}
+
+			pinButton := widget.NewButtonWithIcon("", theme.ContentAddIcon(), func() {})
+			copyButton := widget.NewButtonWithIcon("", theme.ContentCopyIcon(), func() {})
+			deleteButton := widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {})
+
+			buttons := container.NewHBox(pinButton, copyButton, deleteButton)
+			bottomBar := container.NewBorder(nil, nil, timeLabel, buttons)
+
+			// Create the main container
+			return container.NewBorder(
+				nil,
+				bottomBar,
+				nil,
+				nil,
+				contentContainer,
+			)
+		},
+		func(i widget.ListItemID, o fyne.CanvasObject) {
+			if i >= len(cm.items) {
+				return // Safety check for index out of range
+			}
+
+			item := cm.items[i]
+
+			// Properly cast to container
+			content, ok := o.(*fyne.Container)
+			if !ok {
+				return // Skip if wrong type
+			}
+
+			// Get content container (which contains the label and tooltip placeholder)
+			contentContainer, ok := content.Objects[0].(*fyne.Container)
+			if !ok {
+				return
+			}
+
+			// Get the content label and tooltip placeholder
+			contentLabel, _ := contentContainer.Objects[0].(*widget.Label)
+			tooltipContainer, ok := contentContainer.Objects[1].(*fyne.Container)
+			if !ok {
+				return
+			}
+
+			// Get bottom bar
+			bottomBar, _ := content.Objects[1].(*fyne.Container)
+
+			if contentLabel != nil {
+				// Get first two lines of content
+				lines := strings.Split(item.content, "\n")
+				truncatedContent := item.content
+
+				// Check if the content needs to be truncated
+				if len(lines) > 2 {
+					// Only show first two lines
+					truncatedContent = lines[0]
+					if len(lines) > 1 {
+						truncatedContent += "\n" + lines[1]
+					}
+
+					// Create custom tooltip if there's more content
+					tooltip := NewCustomTooltip(item.content, cm.window)
+					tooltipContainer.Objects[0] = tooltip
+					tooltipContainer.Refresh()
+					tooltipContainer.Show()
+				} else {
+					// Hide tooltip if not needed
+					tooltipContainer.Hide()
+				}
+
+				// Set content
+				contentLabel.SetText(truncatedContent)
+			}
+
+			if bottomBar != nil {
+				timeLabel, _ := bottomBar.Objects[0].(*widget.Label)
+				buttonsContainer, _ := bottomBar.Objects[1].(*fyne.Container)
+
+				if timeLabel != nil {
+					// Set time
+					timeLabel.SetText(item.timestamp.Format("15:04:05"))
+				}
+
+				if buttonsContainer != nil && len(buttonsContainer.Objects) >= 3 {
+					pinButton, _ := buttonsContainer.Objects[0].(*widget.Button)
+					copyButton, _ := buttonsContainer.Objects[1].(*widget.Button)
+					deleteButton, _ := buttonsContainer.Objects[2].(*widget.Button)
+
+					// Set pin icon based on state
+					if pinButton != nil {
+						if cm.pinned[i] {
+							pinButton.SetIcon(theme.ContentRemoveIcon())
+						} else {
+							pinButton.SetIcon(theme.ContentAddIcon())
+						}
+
+						pinButton.OnTapped = func() {
+							cm.pinned[i] = !cm.pinned[i]
+							cm.list.Refresh()
+						}
+					}
+
+					// Set button actions
+					if copyButton != nil {
+						copyButton.OnTapped = func() {
+							go func() {
+								if cm.isWayland {
+									// For Wayland, use wl-copy instead of robotgo
+									cmd := exec.Command("wl-copy", item.content)
+									cmd.Run()
+								} else {
+									robotgo.WriteAll(item.content)
+								}
+
+								// Hide the window
+								cm.window.Hide()
+							}()
+						}
+					}
+
+					if deleteButton != nil {
+						deleteButton.OnTapped = func() {
+							cm.removeItem(i)
+						}
+					}
+				}
+			}
+		},
+	)
+}
+
+// Helper function to create a scrollable text display
+func createScrollableTextDisplay(content string) fyne.CanvasObject {
+	textDisplay := widget.NewLabel(content)
+	textDisplay.Wrapping = fyne.TextWrapWord
+
+	// Wrap in a scroll container
+	scrollContainer := container.NewScroll(textDisplay)
+
+	return scrollContainer
 }
 
 // removeItem removes an item from clipboard history
@@ -525,7 +862,7 @@ func registerGlobalShortcut(w fyne.Window, cm *ClipboardManager) {
 			done := make(chan struct{})
 			go func() {
 				// Get the current mouse position
-				mouseX, mouseY := robotgo.GetMousePos()
+				mouseX, mouseY := robotgo.Location()
 
 				// Get screen size (primary monitor)
 				screenWidth, screenHeight := robotgo.GetScreenSize()
@@ -661,6 +998,225 @@ func (cm *ClipboardManager) UpdateHotkey(modifierKey, actionKey string) {
 	}
 }
 
+// func setWindowAlwaysOnTop(windowTitle string) {
+// 	// Wait a moment for the window to appear and stabilize
+// 	time.Sleep(500 * time.Millisecond)
+// 	log.Print("AAAAAAAAAAAAAa")
+// 	if isWaylandSession() {
+// 		// For Wayland, try KDE-specific approach if it appears to be KDE
+// 		// if os.Getenv("KDE_FULL_SESSION") != "" || os.Getenv("XDG_CURRENT_DESKTOP") == "KDE" {
+// 		// 	setKDEKeepAboveOthers(windowTitle)
+// 		// 	log.Print("AAAAAAAAAAAAAa")
+// 		// }
+// 	} else {
+// 		// For X11, use xprop/xdotool
+// 		setX11WindowAlwaysOnTop(windowTitle)
+// 	}
+// }
+
+// For X11 environments
+func setX11WindowAlwaysOnTop(windowTitle string) {
+	// Try to find the window by its title
+	cmd := exec.Command("xdotool", "search", "--name", windowTitle)
+	output, err := cmd.Output()
+	if err != nil {
+		fmt.Printf("Could not find window ID: %v\n", err)
+		return
+	}
+
+	// If multiple matches, take the first one
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) == 0 {
+		fmt.Println("No matching windows found")
+		return
+	}
+
+	winID := lines[0]
+
+	// Set the _NET_WM_STATE_ABOVE atom
+	cmd = exec.Command("xprop", "-id", winID, "-f", "_NET_WM_STATE", "32a",
+		"-set", "_NET_WM_STATE", "_NET_WM_STATE_ABOVE")
+	err = cmd.Run()
+	if err != nil {
+		fmt.Printf("Failed to set window always on top: %v\n", err)
+	} else {
+		fmt.Println("Successfully set window always on top via X11")
+	}
+}
+
+// SetKDEWindowKeepAbove sets whether the window should stay above others
+func (cm *ClipboardManager) setKDEWindowKeepAbove(enabled bool) error {
+	// Only proceed if we're running in KDE Plasma
+	if !isKDEPlasma() {
+		return fmt.Errorf("not running in KDE Plasma")
+	}
+
+	// Check if kwriteconfig5 and qdbus are available
+	_, err := exec.LookPath("kwriteconfig5")
+	if err != nil {
+		return fmt.Errorf("kwriteconfig5 not found: %w", err)
+	}
+
+	_, err = exec.LookPath("qdbus")
+	if err != nil {
+		return fmt.Errorf("qdbus not found: %w", err)
+	}
+
+	// Find or create a window rule for our app
+	ruleId, isNew, err := cm.findOrCreateKDEWindowRule()
+	if err != nil {
+		return fmt.Errorf("failed to find/create KDE window rule: %w", err)
+	}
+
+	// Rule group is based on the ID
+	ruleGroup := fmt.Sprintf("%d", ruleId)
+
+	// Set the keep above property based on the enabled parameter
+	kwritePath, _ := exec.LookPath("kwriteconfig5")
+
+	// Set above (keep above others) setting
+	exec.Command(kwritePath, "--file", "kwinrulesrc", "--group", ruleGroup,
+		"--key", "above", strconv.FormatBool(enabled)).Run()
+	exec.Command(kwritePath, "--file", "kwinrulesrc", "--group", ruleGroup,
+		"--key", "aboverule", "2").Run() // 2 = force yes
+
+	// If it's a new rule or if we're enabling the feature, also set these properties
+	if isNew || enabled {
+		// Window matching criteria - match by window title EXACTLY (not substring)
+		exec.Command(kwritePath, "--file", "kwinrulesrc", "--group", ruleGroup,
+			"--key", "title", appName).Run()
+		exec.Command(kwritePath, "--file", "kwinrulesrc", "--group", ruleGroup,
+			"--key", "titlematch", "0").Run() // 0 = exact match (was 2 for substring)
+
+		// Description
+		exec.Command(kwritePath, "--file", "kwinrulesrc", "--group", ruleGroup,
+			"--key", "Description", appName+" Window Rule").Run()
+
+		// If enabled, also set Layer to Above (not popup/overlay)
+		if enabled {
+			// Force Layer: Above
+			exec.Command(kwritePath, "--file", "kwinrulesrc", "--group", ruleGroup,
+				"--key", "layer", "4").Run() // 4 = Above layer (was 6 for Overlay)
+			exec.Command(kwritePath, "--file", "kwinrulesrc", "--group", ruleGroup,
+				"--key", "layerrule", "2").Run() // 2 = force yes
+		} else {
+			// Reset layer to normal
+			exec.Command(kwritePath, "--file", "kwinrulesrc", "--group", ruleGroup,
+				"--key", "layer", "0").Run() // 0 = normal
+			exec.Command(kwritePath, "--file", "kwinrulesrc", "--group", ruleGroup,
+				"--key", "layerrule", "2").Run() // 2 = force yes
+		}
+
+		// Make the rule apply to all desktops
+		exec.Command(kwritePath, "--file", "kwinrulesrc", "--group", ruleGroup,
+			"--key", "desktops", "").Run()
+		exec.Command(kwritePath, "--file", "kwinrulesrc", "--group", ruleGroup,
+			"--key", "desktopsrule", "3").Run() // 3 = all desktops
+
+		// Apply to all activities
+		exec.Command(kwritePath, "--file", "kwinrulesrc", "--group", ruleGroup,
+			"--key", "activity", "").Run()
+		exec.Command(kwritePath, "--file", "kwinrulesrc", "--group", ruleGroup,
+			"--key", "activityrule", "3").Run() // 3 = all activities
+	}
+
+	// Reload KWin rules
+	exec.Command("qdbus", "org.kde.KWin", "/KWin", "org.kde.KWin.reconfigure").Run()
+
+	return nil
+}
+
+// Helper method to find an existing window rule or create a new one
+func (cm *ClipboardManager) findOrCreateKDEWindowRule() (int, bool, error) {
+	// Get number of existing rules in kwinrulesrc
+	countCmd := exec.Command("kreadconfig5", "--file", "kwinrulesrc", "--group", "General", "--key", "count")
+	countOutput, err := countCmd.Output()
+	count := 0
+	if err == nil {
+		count, _ = strconv.Atoi(strings.TrimSpace(string(countOutput)))
+	}
+
+	// Check if there's already a rule for our app
+	for i := 1; i <= count; i++ {
+		ruleGroup := fmt.Sprintf("%d", i)
+
+		// Get rule description
+		descCmd := exec.Command("kreadconfig5", "--file", "kwinrulesrc", "--group", ruleGroup, "--key", "Description")
+		descOutput, err := descCmd.Output()
+		if err != nil {
+			continue
+		}
+
+		desc := strings.TrimSpace(string(descOutput))
+		// Check if this rule is for our app
+		if strings.Contains(desc, appName) {
+			return i, false, nil // Found existing rule
+		}
+
+		// Check title match as well
+		titleCmd := exec.Command("kreadconfig5", "--file", "kwinrulesrc", "--group", ruleGroup, "--key", "title")
+		titleOutput, err := titleCmd.Output()
+		if err != nil {
+			continue
+		}
+
+		title := strings.TrimSpace(string(titleOutput))
+		if title == appName {
+			return i, false, nil // Found existing rule
+		}
+	}
+
+	// No existing rule found, create a new one
+	newRuleIndex := count + 1
+
+	// Set the new rule count
+	kwritePath, _ := exec.LookPath("kwriteconfig5")
+	exec.Command(kwritePath, "--file", "kwinrulesrc", "--group", "General", "--key", "count", strconv.Itoa(newRuleIndex)).Run()
+
+	return newRuleIndex, true, nil // Return new rule index
+}
+
+func isKDEPlasma() bool {
+	// Check common environment variables that indicate KDE
+	desktop := os.Getenv("XDG_CURRENT_DESKTOP")
+	session := os.Getenv("KDE_FULL_SESSION")
+
+	return strings.Contains(strings.ToLower(desktop), "kde") || session == "true"
+}
+
+// IsKDEKeepAboveEnabled checks if Keep Above is currently enabled for our app
+func (cm *ClipboardManager) isKDEKeepAboveEnabled() bool {
+	// Only relevant for KDE Plasma
+	if !isKDEPlasma() {
+		return false
+	}
+
+	// Check if kreadconfig5 is available
+	_, err := exec.LookPath("kreadconfig5")
+	if err != nil {
+		return false
+	}
+
+	// Find the rule for our app
+	ruleId, isNew, err := cm.findOrCreateKDEWindowRule()
+	if err != nil || isNew {
+		return false // Rule doesn't exist or error
+	}
+
+	// Rule group is based on the ID
+	ruleGroup := fmt.Sprintf("%d", ruleId)
+
+	// Check if keep above is enabled
+	aboveCmd := exec.Command("kreadconfig5", "--file", "kwinrulesrc", "--group", ruleGroup, "--key", "above")
+	aboveOutput, err := aboveCmd.Output()
+	if err != nil {
+		return false
+	}
+
+	above := strings.TrimSpace(string(aboveOutput))
+	return above == "true"
+}
+
 func main() {
 	// Check if another instance is running
 	if ensureSingleInstance() {
@@ -670,14 +1226,17 @@ func main() {
 
 	// Create app with consistent ID
 	a := app.NewWithID(appID)
-	a.Settings().SetTheme(theme.DarkTheme())
+	a.Settings().SetTheme(theme.DefaultTheme())
+	a.SetIcon(resourceNoteboardFynePng)
 
 	w := a.NewWindow(appName)
 	w.Resize(fyne.NewSize(400, 500))
 
+	// w.SetMaster()
+
 	cm := newClipboardManager(w)
 
-	// Register global shortcut if not on Wayland
+	// Register global shortcut if not on Wayland``
 	if !cm.isWayland {
 		registerGlobalShortcut(w, cm)
 	}
@@ -700,7 +1259,7 @@ func main() {
 
 		// This is just visual filtering - in a production app
 		// you'd want to maintain a separate filtered list
-		text = strings.ToLower(text)
+		// text = strings.ToLower(text)
 		// Just refresh the entire list for now to keep it simple
 		cm.list.Refresh()
 	}
@@ -720,6 +1279,7 @@ func main() {
 				} else {
 					w.Show()
 					w.RequestFocus()
+					// go setWindowAlwaysOnTop(appName)
 				}
 			}),
 			fyne.NewMenuItem("Quit", func() {
@@ -728,7 +1288,7 @@ func main() {
 		)
 		desk.SetSystemTrayMenu(m)
 		// Try to load custom icon
-		iconPath := "noteboard-fyne.png" // Relative to executable directory
+		iconPath := "icons/noteboard-fyne.png" // Relative to executable directory
 		customIcon, err := loadIconResource(iconPath)
 		if err != nil {
 			// Fall back to default icon on error
@@ -773,7 +1333,7 @@ func main() {
 		cm.addItem("Running on X11 mode")
 	}
 
-	cm.addItem("Welcome to Manjaro Clipboard Manager!")
+	cm.addItem("Welcome to NoteBoard!")
 
 	// Display hotkey info
 	if cm.isWayland {
@@ -786,6 +1346,7 @@ func main() {
 
 	w.Show()
 	a.Run()
+	// go setWindowAlwaysOnTop(appName)
 }
 
 // Function to load an icon from the project directory

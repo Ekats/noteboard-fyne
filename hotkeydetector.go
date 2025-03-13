@@ -480,6 +480,34 @@ func ShowSettingsDialog(a fyne.App, cm *ClipboardManager) {
 		}
 	}
 
+	// KDE-specific settings
+	var kdeOptions *fyne.Container
+	if isKDEPlasma() {
+		// Add "Keep Above Others" toggle for KDE
+		keepAboveToggle := widget.NewCheck("Keep window above others (overlay mode)", func(checked bool) {
+			go func() {
+				err := cm.setKDEWindowKeepAbove(checked)
+				if err != nil {
+					dialog.ShowError(fmt.Errorf("failed to change keep above setting: %v", err), settingsWindow)
+				} else {
+					// Apply the change to current window as well
+					if checked {
+						dialog.ShowInformation("Success", "Window will now stay above others. Changes will apply after restart.", settingsWindow)
+					} else {
+						dialog.ShowInformation("Success", "Window will no longer stay above others. Changes will apply after restart.", settingsWindow)
+					}
+				}
+			}()
+		})
+		// Set initial toggle state based on current setting
+		keepAboveToggle.SetChecked(cm.isKDEKeepAboveEnabled())
+
+		kdeOptions = container.NewVBox(
+			widget.NewLabel("KDE Window Settings"),
+			keepAboveToggle,
+		)
+	}
+
 	// Wayland-specific options
 	var waylandOptions *fyne.Container
 	if cm.isWayland {
@@ -519,6 +547,12 @@ func ShowSettingsDialog(a fyne.App, cm *ClipboardManager) {
 		widget.NewSeparator(),
 		hotkeyContainer,
 	)
+
+	// Add KDE options if applicable
+	if kdeOptions != nil {
+		vbox.Add(widget.NewSeparator())
+		vbox.Add(kdeOptions)
+	}
 
 	// Add Wayland options if applicable
 	if waylandOptions != nil {
